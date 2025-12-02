@@ -9,6 +9,23 @@ from fastapi.security import APIKeyHeader
 from fastapi import FastAPI, HTTPException, Depends
 
 
+class TCPConnectorWithHandshake(aiohttp.TCPConnector):
+    def __init__(self, *args, ssl_handshake_timeout=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hs_to = ssl_handshake_timeout
+
+    async def _wrap_create_connection(
+        self, *args, addr_infos, req, timeout,
+        client_error=aiohttp.ClientConnectorError, **kwargs
+    ):
+        if kwargs.get("ssl") and self._hs_to is not None:
+            kwargs.setdefault("ssl_handshake_timeout", self._hs_to)
+        return await super()._wrap_create_connection(
+            *args, addr_infos=addr_infos, req=req, timeout=timeout,
+            client_error=client_error, **kwargs
+        )
+
+
 class Application:
     def __init__(self):
         self.logger = self.setup_logging()
@@ -47,7 +64,17 @@ class Application:
         
         @self.app.on_event("startup")
         async def startup_event():
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(
+                total=180,
+                connect=180,
+                sock_connect=180,
+                sock_read=120
+            )
+            connector = TCPConnectorWithHandshake(keepalive_timeout=120, ssl_handshake_timeout=180)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector
+            )
             self.bot = async_telebot.AsyncTeleBot(token=self.telegram_token)
             asyncio.create_task(self.main())
 
@@ -58,12 +85,17 @@ class Application:
 
     async def check_health(self):
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timeout = aiohttp.ClientTimeout(
+            total=180,
+            connect=180,
+            sock_connect=180,
+            sock_read=120
+        )
         try:
             async with self.session.get(
                 f"{self.remote_url}/health",
-                timeout=120,
                 headers={"X-Token": self.ssl_token},
-                ssl=True
+                timeout=timeout
             ) as response:
                 response.raise_for_status()
                 response_text = await response.text()
@@ -84,6 +116,14 @@ class Application:
                         f"[{current_time}] Health check failed for {self.remote_url[:-5]}: {error_message}"
                     )
                     return False, error_message
+        except aiohttp.ClientConnectorError as e:
+            self.logger.error(
+                "CONNECT FAIL: %r os_error=%r errno=%r cause=%r",
+                e, getattr(e, "os_error", None),
+                getattr(getattr(e, "os_error", None), "errno", None),
+                e.__cause__,
+            )
+            return False, f"{type(e).__name__}: os_error={repr(getattr(e,'os_error',None))}"
         except Exception as e:
             exc_type = type(e).__name__
             self.logger.error(f"[{current_time}] Health check failed for {self.remote_url[:-5]}: {exc_type}: {e}")
